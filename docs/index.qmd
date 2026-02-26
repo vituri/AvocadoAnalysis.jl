@@ -1,0 +1,632 @@
+---
+title: "Guacamole classification"
+author:
+  - name: Guilherme Vituri F. Pinto
+    orcid: 0000-0002-7813-8777
+    corresponding: true
+    email: vituri.vituri@gmail.com
+    roles:
+      - Investigation
+      - Project administration
+      - Software
+      - Visualization
+    affiliations:
+      - Universidade Estadual Paulista
+  - name: Sergio Ura
+  - name: Northon
+keywords:
+  - Topological Data Analysis
+  - Persistent homology
+  - Diptera classification
+  - Wing venation
+abstract: |
+  xxxxxxxxxxxxxxx
+plain-language-summary: |
+  xxxxxxxxxxxxx
+key-points:
+  - xxxxxxxxxxxxxxxxxxxxx
+date: last-modified
+number-sections: true
+jupyter: julia-1.12.4-project-1.12
+---
+
+# 0D Cubical Persistent Homology Analysis
+
+This notebook reproduces the pipeline from `analysis.jl` using `AvocadoAnalysis.jl` and presents results in an exploratory format.
+
+```{julia}
+using Pkg
+Pkg.activate(@__DIR__)
+
+using AvocadoAnalysis
+using CSV
+using DataFrames
+using Images
+using Ripserer
+using Statistics
+```
+
+```{julia}
+#| include: false
+const IMAGES_DIR = joinpath(@__DIR__, "images")
+const RESIZE_TO = (256, 256)
+const CUTOFF = 0.3
+const INVERT_INTENSITY = true
+const CUTOFF1 = 0.1
+const INVERT_INTENSITY1 = false
+const OUTPUT_CSV = joinpath(@__DIR__, "results", "h0_persistence_summary.csv")
+const OUTPUT_CSV_H1 = joinpath(@__DIR__, "results", "h1_persistence_summary.csv")
+
+(; IMAGES_DIR, RESIZE_TO, CUTOFF, INVERT_INTENSITY, OUTPUT_CSV, OUTPUT_CSV_H1)
+```
+
+## Image mosaic (`mosaicview`)
+
+```{julia}
+image_files = list_image_files(IMAGES_DIR)
+
+mosaic_resize = (220, 220)
+image_tiles = [Gray.(load_and_resize_image(path; resize_to = mosaic_resize, invert = INVERT_INTENSITY)) for path in image_files]
+
+n_images = length(image_tiles)
+n_cols_tiles = ceil(Int, sqrt(n_images))
+n_rows_tiles = ceil(Int, n_images / n_cols_tiles)
+
+image_mosaic = mosaicview(image_tiles...; nrow = n_rows_tiles, ncol = n_cols_tiles, npad = 4)
+image_mosaic
+```
+
+## Sublevel filtration sanity check
+
+This section shows what a sublevel set does to one image. For each threshold `t`, we keep pixels with value `<= t`.
+
+```{julia}
+example_image_path = first(image_files)
+example_image_name = basename(example_image_path)
+example_image = load_and_resize_image(example_image_path; resize_to = RESIZE_TO, invert = INVERT_INTENSITY)
+thresholds = collect(0.0:0.1:1.0)
+
+binary_sublevels = [Gray.(Float64.(example_image .<= t)) for t in thresholds]
+intensity_sublevels = [
+    Gray.(ifelse.(example_image .<= t, example_image, 1.0))
+    for t in thresholds
+]
+
+n_show = length(thresholds)
+sublevel_binary_mosaic = mosaicview(binary_sublevels...; nrow = 2, ncol = ceil(Int, n_show / 2), npad = 4)
+sublevel_intensity_mosaic = mosaicview(intensity_sublevels...; nrow = 2, ncol = ceil(Int, n_show / 2), npad = 4)
+
+DataFrame(
+    example_image = [example_image_name],
+    thresholds = [join(string.(thresholds), ", ")],
+)
+```
+
+```{julia}
+sublevel_binary_mosaic
+```
+
+```{julia}
+sublevel_intensity_mosaic
+```
+
+```{julia}
+DataFrame(
+    panel = eachindex(thresholds),
+    threshold = thresholds,
+    pixels_in_sublevel = [count(example_image .<= t) for t in thresholds],
+    fraction_in_sublevel = [count(example_image .<= t) / length(example_image) for t in thresholds],
+)
+```
+
+## Run the analysis
+
+```{julia}
+results = analyze_directory(
+    IMAGES_DIR;
+    resize_to = RESIZE_TO,
+    cutoff = CUTOFF,
+    invert = INVERT_INTENSITY,
+    output_csv = OUTPUT_CSV,
+)
+
+results
+```
+
+```{julia}
+println("CSV written to: ", OUTPUT_CSV)
+```
+
+## Per-image summary table
+
+```{julia}
+summary_table = sort(
+    select(
+        results,
+        :image_file,
+        :n_intervals_total,
+        :n_intervals_finite,
+        :n_intervals_infinite,
+        :median_persistence,
+        :mean_persistence,
+        :std_persistence,
+        :q25_persistence,
+        :q75_persistence,
+        :max_persistence,
+    ),
+    :median_persistence,
+    rev = true,
+)
+
+summary_table
+```
+
+```{julia}
+#| include: false
+function interval_table_for_image(
+    image_path::AbstractString;
+    resize_to::NTuple{2, Int} = RESIZE_TO,
+    cutoff::Real = CUTOFF,
+    invert::Bool = INVERT_INTENSITY,
+)
+    resized = load_and_resize_image(image_path; resize_to = resize_to, invert = invert)
+    dgm = h0_cubical_diagram(resized; cutoff = cutoff)
+    finite = collect(filter(isfinite, dgm))
+
+    if isempty(finite)
+        return DataFrame(
+            image_file = String[],
+            birth = Float64[],
+            death = Float64[],
+            persistence = Float64[],
+        )
+    end
+
+    return DataFrame(
+        image_file = fill(basename(image_path), length(finite)),
+        birth = Float64[Ripserer.birth(i) for i in finite],
+        death = Float64[Ripserer.death(i) for i in finite],
+        persistence = Float64[Ripserer.persistence(i) for i in finite],
+    )
+end
+
+interval_tables = [interval_table_for_image(path) for path in image_files]
+interval_schema = DataFrame(
+    image_file = String[],
+    birth = Float64[],
+    death = Float64[],
+    persistence = Float64[],
+)
+all_intervals = isempty(interval_tables) ? interval_schema : vcat(interval_schema, interval_tables...)
+```
+
+
+```{julia}
+#| include: false
+has_cairomakie = false
+try
+    @eval using CairoMakie
+    CairoMakie.set_theme!(CairoMakie.Theme())
+    has_cairomakie = true
+catch err
+    @warn "CairoMakie not available; plots skipped." exception = err
+end
+
+has_cairomakie
+```
+
+## Image with barcode (per image)
+
+```{julia}
+function image_and_barcode_figure(
+    image_path::AbstractString;
+    resize_to::NTuple{2, Int} = RESIZE_TO,
+    cutoff::Real = CUTOFF,
+    invert::Bool = INVERT_INTENSITY,
+    max_bars::Int = 300,
+)
+    img = load_and_resize_image(image_path; resize_to = resize_to, invert = invert)
+    dgm = h0_cubical_diagram(img; cutoff = cutoff)
+    finite = collect(filter(isfinite, dgm))
+
+    births = Float64[Ripserer.birth(interval) for interval in finite]
+    deaths = Float64[Ripserer.death(interval) for interval in finite]
+    persistence = deaths .- births
+
+    keep_order = sortperm(persistence; rev = true)
+    n_keep = min(max_bars, length(keep_order))
+    keep_idx = keep_order[1:n_keep]
+
+    births_keep = births[keep_idx]
+    deaths_keep = deaths[keep_idx]
+    pers_keep = persistence[keep_idx]
+    y = 1:n_keep
+
+    fig = CairoMakie.Figure(size = (1200, 460))
+
+    ax_img = CairoMakie.Axis(
+        fig[1, 1],
+        title = "Image: $(basename(image_path))",
+        xlabel = "x",
+        ylabel = "y",
+    )
+    CairoMakie.image!(ax_img, img; colormap = :grays, interpolate = false)
+    CairoMakie.hidedecorations!(ax_img, ticks = false, ticklabels = false, grid = false)
+
+    ax_barcode = CairoMakie.Axis(
+        fig[1, 2],
+        title = "H0 barcode (top $(n_keep) bars by persistence)",
+        xlabel = "Filtration value",
+        ylabel = "Bar index",
+    )
+
+    for i in eachindex(y)
+        CairoMakie.lines!(ax_barcode, [births_keep[i], deaths_keep[i]], [y[i], y[i]]; color = :steelblue)
+    end
+
+    max_death = isempty(deaths_keep) ? 1.0 : maximum(deaths_keep)
+    CairoMakie.xlims!(ax_barcode, 0.0, max(max_death, 1e-6))
+    CairoMakie.ylims!(ax_barcode, 0.0, max(n_keep + 1, 2))
+
+    median_persistence = isempty(pers_keep) ? NaN : median(pers_keep)
+    stats_text = "finite bars=$(length(finite)); shown=$(n_keep); median persistence=$(round(median_persistence, digits = 4))"
+    CairoMakie.Label(fig[2, 1:2], stats_text, tellwidth = false)
+
+    fig
+end
+```
+
+```{julia}
+if has_cairomakie
+    for image_path in image_files
+        display(image_and_barcode_figure(image_path))
+    end
+else
+    DataFrame(message = ["CairoMakie not available; per-image barcode figures skipped."])
+end
+```
+
+```{julia}
+if has_cairomakie && DataFrames.nrow(results) > 0
+    ordered = sort(results, :median_persistence, rev = true)
+
+    fig = CairoMakie.Figure(size = (1100, 800))
+
+    ax1 = CairoMakie.Axis(
+        fig[1, 1],
+        title = "Median persistence by image",
+        xlabel = "Image",
+        ylabel = "Median persistence",
+        xticklabelrotation = pi / 6,
+    )
+    CairoMakie.barplot!(ax1, 1:DataFrames.nrow(ordered), ordered.median_persistence)
+    ax1.xticks = (1:DataFrames.nrow(ordered), ordered.image_file)
+
+    ax2 = CairoMakie.Axis(
+        fig[2, 1],
+        title = "Mean vs standard deviation of persistence",
+        xlabel = "Mean persistence",
+        ylabel = "Std persistence",
+    )
+    CairoMakie.scatter!(ax2, ordered.mean_persistence, ordered.std_persistence)
+
+    ax3 = CairoMakie.Axis(
+        fig[1:2, 2],
+        title = "Distribution of finite persistence values",
+        xlabel = "Persistence",
+        ylabel = "Count",
+    )
+    if DataFrames.nrow(all_intervals) > 0
+        CairoMakie.hist!(ax3, all_intervals.persistence, bins = 40)
+    end
+
+    fig
+end
+```
+
+# 1D Cubical Persistent Homology Analysis
+
+This section mirrors the 0D workflow for 1-dimensional cubical persistence (loops).
+
+```{julia}
+#| include: false
+function h1_cubical_diagram(
+    image::AbstractMatrix;
+    cutoff::Real = CUTOFF1,
+    reps = false,
+    alg::Symbol = :cohomology,
+)
+    diagrams = ripserer(Cubical(image); dim_max = 1, cutoff = cutoff, reps = reps, alg = alg)
+    return diagrams[2]
+end
+
+function analyze_image_h1(
+    path::AbstractString;
+    resize_to::NTuple{2, Int} = RESIZE_TO,
+    cutoff::Real = CUTOFF1,
+    invert::Bool = INVERT_INTENSITY1
+)
+    resized = load_and_resize_image(path; resize_to = resize_to, invert = invert)
+    diagram = h1_cubical_diagram(resized; cutoff = cutoff)
+    stats = diagram_summary(diagram)
+
+    return merge(
+        (
+            image_file = basename(path),
+            image_path = abspath(path),
+            resized_height = size(resized, 1),
+            resized_width = size(resized, 2),
+            cutoff = Float64(cutoff),
+            invert = invert,
+        ),
+        stats,
+    )
+end
+
+function analyze_directory_h1(
+    images_dir::AbstractString;
+    resize_to::NTuple{2, Int} = RESIZE_TO,
+    cutoff::Real = 0.1,
+    invert::Bool = false,
+    output_csv::Union{Nothing, AbstractString} = nothing,
+)
+    paths = list_image_files(images_dir)
+    rows = [analyze_image_h1(path; resize_to = resize_to, cutoff = cutoff, invert = invert) for path in paths]
+    results_local = DataFrame(rows)
+
+    if output_csv !== nothing
+        mkpath(dirname(output_csv))
+        CSV.write(output_csv, results_local)
+    end
+
+    return results_local
+end
+```
+
+## Run the 1D analysis
+
+```{julia}
+results_h1 = analyze_directory_h1(
+    IMAGES_DIR;
+    resize_to = RESIZE_TO,
+    cutoff = CUTOFF1,
+    invert = INVERT_INTENSITY1,
+    output_csv = OUTPUT_CSV_H1,
+)
+
+results_h1
+```
+
+```{julia}
+println("CSV written to: ", OUTPUT_CSV_H1)
+```
+
+## Per-image 1D summary table
+
+```{julia}
+summary_table_h1 = sort(
+    select(
+        results_h1,
+        :image_file,
+        :n_intervals_total,
+        :n_intervals_finite,
+        :n_intervals_infinite,
+        :median_persistence,
+        :mean_persistence,
+        :std_persistence,
+        :q25_persistence,
+        :q75_persistence,
+        :max_persistence,
+    ),
+    :median_persistence,
+    rev = true,
+)
+
+summary_table_h1
+```
+
+```{julia}
+#| include: false
+function interval_table_for_image_h1(
+    image_path::AbstractString;
+    resize_to::NTuple{2, Int} = RESIZE_TO,
+    cutoff::Real = CUTOFF1,
+    invert::Bool = INVERT_INTENSITY1,
+)
+    resized = load_and_resize_image(image_path; resize_to = resize_to, invert = invert)
+    dgm = h1_cubical_diagram(resized; cutoff = cutoff)
+    finite = collect(filter(isfinite, dgm))
+
+    if isempty(finite)
+        return DataFrame(
+            image_file = String[],
+            birth = Float64[],
+            death = Float64[],
+            persistence = Float64[],
+        )
+    end
+
+    return DataFrame(
+        image_file = fill(basename(image_path), length(finite)),
+        birth = Float64[Ripserer.birth(i) for i in finite],
+        death = Float64[Ripserer.death(i) for i in finite],
+        persistence = Float64[Ripserer.persistence(i) for i in finite],
+    )
+end
+
+interval_tables_h1 = [interval_table_for_image_h1(path) for path in image_files]
+interval_schema_h1 = DataFrame(
+    image_file = String[],
+    birth = Float64[],
+    death = Float64[],
+    persistence = Float64[],
+)
+all_intervals_h1 = isempty(interval_tables_h1) ? interval_schema_h1 : vcat(interval_schema_h1, interval_tables_h1...)
+```
+
+## Image with H1 barcode (per image)
+
+```{julia}
+function h1_representative_segments(interval)
+    segments = NTuple{4, Float64}[]
+
+    if !hasproperty(interval, :representative)
+        return segments
+    end
+
+    for element in Ripserer.representative(interval)
+        verts = vertices(simplex(element))
+        if length(verts) != 2
+            continue
+        end
+        u, v = verts
+        push!(segments, (Float64(u[2]), Float64(u[1]), Float64(v[2]), Float64(v[1])))
+    end
+
+    return segments
+end
+
+function image_and_barcode_figure_h1(
+    image_path::AbstractString;
+    resize_to::NTuple{2, Int} = RESIZE_TO,
+    cutoff::Real = CUTOFF1,
+    invert::Bool = INVERT_INTENSITY1,
+    max_bars::Int = 300,
+    max_generators::Int = 5,
+    generator_alg::Symbol = :homology,
+)
+    img = load_and_resize_image(image_path; resize_to = resize_to, invert = invert)
+    dgm = h1_cubical_diagram(img; cutoff = cutoff, reps = 1, alg = generator_alg)
+    finite = collect(filter(isfinite, dgm))
+
+    births = Float64[Ripserer.birth(interval) for interval in finite]
+    deaths = Float64[Ripserer.death(interval) for interval in finite]
+    persistence = deaths .- births
+
+    keep_order = sortperm(persistence; rev = true)
+    n_keep = min(max_bars, length(keep_order))
+    keep_idx = keep_order[1:n_keep]
+
+    births_keep = births[keep_idx]
+    deaths_keep = deaths[keep_idx]
+    pers_keep = persistence[keep_idx]
+    y = 1:n_keep
+    n_generators = min(max_generators, n_keep)
+    generator_colors = [:deepskyblue3, :goldenrod2, :springgreen4, :orchid3, :tomato3]
+
+    fig = CairoMakie.Figure(size = (1200, 460))
+
+    ax_img = CairoMakie.Axis(
+        fig[1, 1],
+        title = "Image: $(basename(image_path))",
+        xlabel = "x",
+        ylabel = "y",
+    )
+    CairoMakie.image!(ax_img, img; colormap = :grays, interpolate = false)
+    CairoMakie.hidedecorations!(ax_img, ticks = false, ticklabels = false, grid = false)
+
+    for i in 1:n_generators
+        interval = finite[keep_idx[i]]
+        for (x1, y1, x2, y2) in h1_representative_segments(interval)
+            CairoMakie.lines!(
+                ax_img,
+                [x1, x2],
+                [y1, y2];
+                color = (generator_colors[i], 0.95),
+                linewidth = 2.0,
+            )
+        end
+    end
+
+    ax_barcode = CairoMakie.Axis(
+        fig[1, 2],
+        title = "H1 barcode (top $(n_keep) bars by persistence, $(generator_alg))",
+        xlabel = "Filtration value",
+        ylabel = "Bar index",
+    )
+
+    for i in eachindex(y)
+        is_top_generator = i <= n_generators
+        bar_color = is_top_generator ? generator_colors[i] : :darkorange3
+        bar_width = is_top_generator ? 2.5 : 1.0
+
+        CairoMakie.lines!(
+            ax_barcode,
+            [births_keep[i], deaths_keep[i]],
+            [y[i], y[i]];
+            color = bar_color,
+            linewidth = bar_width,
+        )
+        if is_top_generator
+            CairoMakie.text!(
+                ax_barcode,
+                deaths_keep[i],
+                y[i];
+                text = "G$(i)",
+                align = (:left, :center),
+                color = bar_color,
+                fontsize = 10,
+            )
+        end
+    end
+
+    max_death = isempty(deaths_keep) ? 1.0 : maximum(deaths_keep)
+    CairoMakie.xlims!(ax_barcode, 0.0, max(max_death, 1e-6))
+    CairoMakie.ylims!(ax_barcode, 0.0, max(n_keep + 1, 2))
+
+    median_persistence = isempty(pers_keep) ? NaN : median(pers_keep)
+    top_text = n_generators == 0 ? "none" : join(["G$(i)=$(round(pers_keep[i], digits = 4))" for i in 1:n_generators], ", ")
+    stats_text = "finite H1 bars=$(length(finite)); shown=$(n_keep); top $(generator_alg) generators on image: $(top_text); median persistence=$(round(median_persistence, digits = 4))"
+    CairoMakie.Label(fig[2, 1:2], stats_text, tellwidth = false)
+
+    fig
+end
+```
+
+```{julia}
+if has_cairomakie
+    for image_path in image_files
+        display(image_and_barcode_figure_h1(image_path))
+    end
+else
+    DataFrame(message = ["CairoMakie not available; per-image H1 barcode figures skipped."])
+end
+```
+
+```{julia}
+if has_cairomakie && DataFrames.nrow(results_h1) > 0
+    ordered_h1 = sort(results_h1, :median_persistence, rev = true)
+
+    fig = CairoMakie.Figure(size = (1100, 800))
+
+    ax1 = CairoMakie.Axis(
+        fig[1, 1],
+        title = "H1 median persistence by image",
+        xlabel = "Image",
+        ylabel = "Median persistence",
+        xticklabelrotation = pi / 6,
+    )
+    CairoMakie.barplot!(ax1, 1:DataFrames.nrow(ordered_h1), ordered_h1.median_persistence; color = :darkorange3)
+    ax1.xticks = (1:DataFrames.nrow(ordered_h1), ordered_h1.image_file)
+
+    ax2 = CairoMakie.Axis(
+        fig[2, 1],
+        title = "H1 mean vs standard deviation of persistence",
+        xlabel = "Mean persistence",
+        ylabel = "Std persistence",
+    )
+    CairoMakie.scatter!(ax2, ordered_h1.mean_persistence, ordered_h1.std_persistence; color = :darkorange3)
+
+    ax3 = CairoMakie.Axis(
+        fig[1:2, 2],
+        title = "H1 distribution of finite persistence values",
+        xlabel = "Persistence",
+        ylabel = "Count",
+    )
+    if DataFrames.nrow(all_intervals_h1) > 0
+        CairoMakie.hist!(ax3, all_intervals_h1.persistence, bins = 40, color = :darkorange3)
+    end
+
+    fig
+end
+```
